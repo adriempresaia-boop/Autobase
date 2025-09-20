@@ -2,13 +2,10 @@ require("dotenv").config();
 const express = require("express");
 const { chromium } = require("playwright");
 
-// FETCH robusto
+// fetch compatible
 const fetchFn = globalThis.fetch
-  ? (...args) => globalThis.fetch(...args)
-  : (...args) => import("node-fetch").then(({ default: f }) => f(...args));
-
-process.on("unhandledRejection", (e) => console.error("UNHANDLED_REJECTION", e));
-process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
+  ? (...a) => globalThis.fetch(...a)
+  : (...a) => import("node-fetch").then(({ default: f }) => f(...a));
 
 const {
   EMAIL,
@@ -21,49 +18,35 @@ const {
 } = process.env;
 
 const MIN_CHARS = Number(MIN_CHARS_ENV || 190);
-
 const app = express();
 app.use(express.json());
 
 let running = true;
 let browser, context, page;
 
+// palabras LATAM prohibidas
 const BANNED = [
   "celular", "vos ", "qué rico", "recién", "ahorita", "computadora",
   "cachetadas", "jalar", "platicar", "carro", "papi", "lechita", "coger "
 ];
 
-/* ========== Utilidades UI / Overlays ========== */
+/* =============== helpers UI =============== */
 async function clickIfVisible(locator) {
   try {
     const el = locator.first();
-    if (await el.isVisible({ timeout: 500 })) {
-      await el.click({ timeout: 2000 });
-      return true;
-    }
+    if (await el.isVisible({ timeout: 400 })) { await el.click({ timeout: 1500 }); return true; }
   } catch {}
   return false;
 }
-
 async function acceptCookiesAnywhere(p) {
-  const texts = [
-    /accept all/i, /accept/i, /agree/i, /allow all/i,
-    /aceptar todas/i, /aceptar/i, /entendido/i
-  ];
+  const texts = [/accept all/i,/accept/i,/agree/i,/allow all/i,/aceptar todas/i,/aceptar/i,/entendido/i];
   for (const t of texts) {
     try {
-      const btn = p.getByRole("button", { name: t });
-      if (await btn.count()) {
-        if (await btn.first().isVisible({ timeout: 500 })) {
-          await btn.first().click({ timeout: 2000 });
-          await p.waitForTimeout(300);
-          break;
-        }
-      }
+      const b = p.getByRole("button",{name:t});
+      if (await b.count()) { if (await b.first().isVisible({timeout:300})) { await b.first().click({timeout:1500}); await p.waitForTimeout(200); } }
     } catch {}
   }
 }
-
 async function clearOverlays(p) {
   try {
     await p.evaluate(() => {
@@ -73,160 +56,123 @@ async function clearOverlays(p) {
         ".toast", ".Toastify", "[role='dialog'][aria-modal='true']",
         ".front-title.d-flex.flex-column.align-center.justify-center"
       ];
-      for (const sel of sels) {
-        document.querySelectorAll(sel).forEach(el => {
-          try { el.style.pointerEvents = "none"; el.style.display = "none"; el.remove?.(); } catch {}
-        });
-      }
+      for (const sel of sels) document.querySelectorAll(sel).forEach(el => { try{ el.style.pointerEvents="none"; el.style.display="none"; el.remove?.(); }catch{} });
     });
   } catch {}
 }
 
-/* ——— Wizard “Información importante…” ——— */
+/* =============== wizard inicial =============== */
 async function dismissOnboardingWizard(p) {
-  for (let i = 0; i < 12; i++) {
+  for (let i=0;i<12;i++){
     await acceptCookiesAnywhere(p);
-    const closeBtn = p.getByRole("button", { name: /close|cerrar|entendido|hecho|ok/i });
-    if (await closeBtn.count()) { try { await closeBtn.first().click({ timeout: 1500 }); } catch {} }
-    const nextBtn = p.getByRole("button", { name: /next|siguiente/i });
-    if (await nextBtn.count()) { try { await nextBtn.first().click({ timeout: 1500 }); } catch {} }
-    const wizardVisible =
-      await p.getByText(/información importante sobre expresiones/i).first().isVisible().catch(()=>false);
-    if (!wizardVisible) break;
-    await p.waitForTimeout(200);
+    await clickIfVisible(p.getByRole("button",{name:/close|cerrar|entendido|hecho|ok/i}));
+    const hasNext = await p.getByRole("button",{name:/next|siguiente/i}).count();
+    if (hasNext) { await clickIfVisible(p.getByRole("button",{name:/next|siguiente/i})); await p.waitForTimeout(150); continue; }
+    const visible = await p.getByText(/información importante sobre expresiones/i).first().isVisible().catch(()=>false);
+    if (!visible) break;
+    await p.waitForTimeout(120);
   }
 }
 
-/* ========== Navegador y login ========== */
+/* =============== navegador =============== */
 async function ensureBrowser() {
-  if (browser) return;
-  browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-  });
-  context = await browser.newContext({
-    viewport: { width: 1366, height: 900 },
-    locale: "es-ES",
-    timezoneId: "Europe/Madrid",
-    userAgent:
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-  });
-  page = await context.newPage();
+  if (browser && !browser.isConnected?.()) { try{ await browser.close(); }catch{} browser=null; }
+  if (!browser) {
+    browser = await chromium.launch({ headless:true, args:["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"] });
+  }
+  if (!context) {
+    context = await browser.newContext({
+      viewport:{width:1366,height:900},
+      locale:"es-ES",
+      timezoneId:"Europe/Madrid",
+      userAgent:"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    });
+  }
+  if (!page || page.isClosed()) page = await context.newPage();
 }
 
-async function findEmailInput(p) {
-  let el = p.getByRole("textbox", { name: /email/i });
-  if (await el.count()) return el.first();
-  el = p.locator('input[placeholder*="email" i], input[name*="email" i], input[type="email"]');
-  if (await el.count()) return el.first();
-  return null;
+/* =============== login específico =============== */
+async function isLoginForm() {
+  try {
+    const email = page.locator('input[placeholder="Email"], input[placeholder*="email" i]');
+    const pass  = page.locator('input[placeholder="Password"], input[type="password"]');
+    return (await email.count()) && (await pass.count());
+  } catch { return false; }
 }
-async function findPasswordInput(p) {
-  let el = p.getByRole("textbox", { name: /contraseña|password/i });
-  if (await el.count()) return el.first();
-  el = p.locator('input[placeholder*="contraseña" i], input[placeholder*="password" i], input[name*="pass" i], input[type="password"]');
-  if (await el.count()) return el.first();
-  return null;
+
+async function performLogin() {
+  const email = page.locator('input[placeholder="Email"], input[placeholder*="email" i]').first();
+  const pass  = page.locator('input[placeholder="Password"], input[type="password"]').first();
+  if (!(await email.count()) || !(await pass.count())) return false;
+
+  await email.click({timeout:2000}); await email.fill(EMAIL, {timeout:2000});
+  await pass.click({timeout:2000});  await pass.fill(PASSWORD, {timeout:2000});
+
+  // botón SIGN IN
+  let btn = page.getByRole("button",{name:/sign in|login|entrar|iniciar sesión/i}).first();
+  if (!(await btn.count())) btn = page.locator('button[type="submit"]').first();
+
+  // esperar a que se habilite
+  try {
+    await page.waitForFunction(b => !b.hasAttribute("disabled"), btn, { timeout: 2000 });
+  } catch {}
+  try { await btn.click({timeout:2000}); } catch { await pass.press("Enter"); }
+
+  // esperar resultado: o dashboard/cola o error
+  const ok = await page.waitForFunction(() => {
+    const t = document.body.innerText || "";
+    return /Waiting for conversation to be claimed/i.test(t) || /START CHATTING/i.test(t);
+  }, { timeout: 8000 }).catch(()=>null);
+
+  // si hay error visible, lo logeamos
+  try {
+    const err = await page.locator(".error, .alert, [role='alert']").first();
+    if (await err.count()) console.log("Login error text:", await err.innerText());
+  } catch {}
+
+  return !!ok;
 }
-async function findSubmitButton(p) {
-  let b = p.getByRole("button", { name: /login|sign in|iniciar sesión|entrar/i });
-  if (await b.count()) return b.first();
-  b = p.locator('button[type="submit"]');
-  if (await b.count()) return b.first();
-  return null;
+
+async function isQueueVisible() {
+  const wait = await page.getByText(/Waiting for conversation to be claimed/i).first().isVisible().catch(()=>false);
+  const startBtn = await page.getByRole("button",{name:/start chatting|start chat|start/i}).first().isVisible().catch(()=>false);
+  return wait || startBtn;
+}
+async function tryStartChatting() {
+  await clearOverlays(page);
+  const locs = [
+    page.getByRole("button",{name:/start chatting|start chat|start/i}),
+    page.getByText(/^START CHATTING$/i),
+    page.locator("[data-testid='start-chatting'], [data-test='start-chatting']")
+  ];
+  for (const l of locs) {
+    try { const el = l.first(); if (await el.isVisible({timeout:200})) { await el.click({timeout:1200}); await page.waitForTimeout(600); return true; } } catch {}
+  }
+  return false;
 }
 
 async function loginIfNeeded() {
-  await page.goto(BASE_URL, { waitUntil: "domcontentloaded" });
+  await page.goto(BASE_URL, { waitUntil:"domcontentloaded" });
   await acceptCookiesAnywhere(page);
   await dismissOnboardingWizard(page);
   await clearOverlays(page);
 
-  // ¿Ya dentro?
+  // ya dentro
   if (await isQueueVisible()) return;
 
-  await clickIfVisible(page.getByText(/^CHAT$/i));
-  await clickIfVisible(page.getByRole("button", { name: /login|entrar|iniciar sesión|sign in/i }));
-  await page.waitForTimeout(400);
-  await acceptCookiesAnywhere(page);
-  await clearOverlays(page);
-
-  const all = [page, ...page.frames()];
-  const deadline = Date.now() + 35000;
-  let done = false;
-  while (!done && Date.now() < deadline) {
-    for (const ctx of all) {
-      try {
-        await clearOverlays(ctx);
-        const email = await findEmailInput(ctx);
-        const pass  = await findPasswordInput(ctx);
-        if (email && pass) {
-          await email.click({ timeout: 3000 }); await email.fill(EMAIL, { timeout: 3000 });
-          await pass .click({ timeout: 3000 }); await pass .fill(PASSWORD, { timeout: 3000 });
-          const btn = await findSubmitButton(ctx);
-          if (btn) await btn.click({ timeout: 3000 }); else await pass.press("Enter");
-          done = true;
-          break;
-        }
-      } catch {}
-    }
-    if (!done) {
-      await clickIfVisible(page.getByRole("button", { name: /email/i }));
-      await clickIfVisible(page.getByText(/email/i));
-      await page.waitForTimeout(800);
-    }
+  // ¿vemos login?
+  if (await isLoginForm()) {
+    const ok = await performLogin();
+    if (!ok) console.log("Login no confirmado; reintento más tarde.");
   }
 
   await page.waitForLoadState("domcontentloaded");
   await dismissOnboardingWizard(page);
   await clearOverlays(page);
-  await page.waitForTimeout(600);
+  await page.waitForTimeout(500);
 }
 
-/* ========== Cola y claiming ========== */
-async function isQueueVisible() {
-  // Pantallas típicas de cola
-  const waiting = await page.getByText(/Waiting for conversation to be claimed/i).first().isVisible().catch(()=>false);
-  const startBtn = await getStartChattingLocator();
-  const startVisible = startBtn && await startBtn.isVisible().catch(()=>false);
-  return waiting || startVisible;
-}
-
-function getStartChattingLocator() {
-  // Varias formas del botón
-  const locs = [
-    page.getByRole("button", { name: /start chatting|start chat|start/i }),
-    page.getByText(/^START CHATTING$/i),
-    page.locator("[data-testid='start-chatting'], [data-test='start-chatting']")
-  ];
-  return {
-    async isVisible() {
-      for (const l of locs) { try { if (await l.first().isVisible({ timeout: 200 })) return true; } catch {} }
-      return false;
-    },
-    async click() {
-      for (const l of locs) {
-        try { if (await l.first().isVisible({ timeout: 200 })) { await l.first().click({ timeout: 1000 }); return true; } } catch {}
-      }
-      return false;
-    }
-  };
-}
-
-async function tryStartChatting() {
-  await clearOverlays(page);
-  const start = getStartChattingLocator();
-  if (await start.isVisible()) {
-    const ok = await start.click();
-    if (ok) {
-      await page.waitForTimeout(800);
-      return true;
-    }
-  }
-  return false;
-}
-
-/* ========== Chat: extracción / generación / envío ========== */
+/* =============== chat =============== */
 const SELECTORS = {
   chatArea: "main, div[role='main'], div[data-testid='chat']",
   inputCandidates: [
@@ -244,27 +190,23 @@ const SELECTORS = {
   sendButton: "button:has-text('Send'), [aria-label='Send'], [data-testid='send'], button:has-text('Enviar')"
 };
 
-async function extractText(selector) {
-  return page.evaluate((sel) => {
-    const el = document.querySelector(sel);
-    return el ? el.innerText : "";
-  }, selector);
+async function extractText(sel) {
+  return page.evaluate(s => (document.querySelector(s)?.innerText) || "", sel);
 }
-
 async function getContextText() {
   const chatText = await extractText(SELECTORS.chatArea);
   let perfil = "";
   try {
     perfil = await page.evaluate(() => {
-      const node = Array.from(document.querySelectorAll("*"))
-        .find(n => /YOU ARE/i.test(n.innerText || ""));
-      if (!node) return "";
-      const box = node.closest("aside") || node.parentElement;
-      return box ? box.innerText : node.innerText;
+      const node = Array.from(document.querySelectorAll("*")).find(n => /YOU ARE/i.test(n.innerText||""));
+      const box = node?.closest("aside") || node?.parentElement;
+      return box ? box.innerText : (node?.innerText || "");
     });
   } catch {}
-  const trimmedChat = (chatText || "").split("\n").slice(-40).join("\n");
-  return { chat: trimmedChat, perfil };
+  return {
+    chat: (chatText||"").split("\n").slice(-40).join("\n"),
+    perfil
+  };
 }
 
 function ensureMinLength(text) {
@@ -272,18 +214,14 @@ function ensureMinLength(text) {
     " Me gusta hablar con calma y con buen rollo; así nos conocemos mejor y todo fluye.",
     " Cuéntame cómo te va el día o qué te apetece ahora; me hace ilusión saberlo y seguir charlando."
   ];
-  let out = text.trim();
-  if (!/[?？]\s*$/.test(out)) {
-    out = out.replace(/[.!…]*\s*$/, "");
-    out += " ¿Tú qué opinas?";
-  }
+  let out = (text||"").trim();
+  if (!/[?？]\s*$/.test(out)) { out = out.replace(/[.!…]*\s*$/, ""); out += " ¿Tú qué opinas?"; }
   while (out.length < MIN_CHARS) {
-    out += fillers[(out.length / 80) % fillers.length | 0];
+    out += fillers[(out.length/80)|0 % fillers.length];
     if (!/[?？]\s*$/.test(out)) out += " ¿Qué te gustaría ahora?";
   }
   return out;
 }
-
 function buildPrompt({ chat, perfil }) {
   return `
 Actúa como el personaje indicado y responde en español de España con tono cercano y sugerente sin ser explícito.
@@ -297,148 +235,124 @@ ${perfil || "No disponible"}
 Últimos mensajes:
 ${chat || "No disponible"}
 
-Da SOLO la respuesta final, sin comillas.`; }
-
+Da SOLO la respuesta final, sin comillas.`.trim();
+}
 async function generateReply(chat, perfil) {
   const body = {
-    model: MODEL,
-    temperature: 0.7,
+    model: MODEL, temperature: 0.7,
     messages: [
       { role: "system", content: "Escribe español de España. Cumple normas: sin insultos, sin quedadas, sin identidad real." },
       { role: "user", content: buildPrompt({ chat, perfil }) }
     ]
   };
-  const res = await fetchFn("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body)
+  const r = await fetchFn("https://api.openai.com/v1/chat/completions", {
+    method:"POST", headers:{Authorization:`Bearer ${OPENAI_API_KEY}`,"Content-Type":"application/json"}, body:JSON.stringify(body)
   });
-  const data = await res.json();
+  const data = await r.json();
   let text = data?.choices?.[0]?.message?.content?.trim() || "";
   text = ensureMinLength(text);
-
   const lower = text.toLowerCase();
-  for (const w of BANNED) if (lower.includes(w)) {
-    text = await generateRepair(text);
-    break;
-  }
-  return ensureMinLength(text);
+  for (const w of BANNED) if (lower.includes(w)) return ensureMinLength(await generateRepair(text));
+  return text;
 }
-
 async function generateRepair(prev) {
   const body = {
-    model: MODEL,
-    temperature: 0.6,
+    model: MODEL, temperature: 0.6,
     messages: [
       { role: "system", content: "Reescribe a español de España, sin regionalismos LATAM, cumpliendo normas." },
       { role: "user", content: `Reformula esto a 220–260 caracteres y termina con pregunta abierta:\n${prev}` }
     ]
   };
-  const res = await fetchFn("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body)
+  const r = await fetchFn("https://api.openai.com/v1/chat/completions", {
+    method:"POST", headers:{Authorization:`Bearer ${OPENAI_API_KEY}`,"Content-Type":"application/json"}, body:JSON.stringify(body)
   });
-  const data = await res.json();
-  return ensureMinLength(data?.choices?.[0]?.message?.content?.trim() || prev);
+  const data = await r.json();
+  return data?.choices?.[0]?.message?.content?.trim() || prev;
 }
-
 async function findInputHandle() {
   await clearOverlays(page);
   for (const sel of SELECTORS.inputCandidates) {
-    const h = await page.locator(sel).last();
-    if (await h.count()) {
-      try { if (await h.isVisible({ timeout: 200 })) return h; } catch {}
-    }
+    const h = page.locator(sel).last();
+    if (await h.count()) { try { if (await h.isVisible({timeout:200})) return h; } catch {} }
   }
   return null;
 }
-
-async function waitForInput(ms = 9000) {
-  const until = Date.now() + ms;
-  while (Date.now() < until) {
+async function waitForInput(ms=10000) {
+  const end = Date.now()+ms;
+  while (Date.now()<end) {
     const h = await findInputHandle();
     if (h) return h;
     await page.waitForTimeout(300);
   }
   return null;
 }
-
 async function sendMessage(text) {
   await dismissOnboardingWizard(page);
-  const input = await waitForInput(9000);
+  const input = await waitForInput(10000);
   if (!input) { console.log("Input no disponible; reintento más tarde."); return false; }
-
   await clearOverlays(page);
-  try { await input.click({ timeout: 3000, force: true }); } catch {}
+  try { await input.click({ timeout: 2500, force:true }); } catch {}
   try { await input.fill(text); } catch { await page.keyboard.type(text); }
-
   await clearOverlays(page);
-  const btn = await page.locator(SELECTORS.sendButton).first();
-  if (await btn.count()) {
-    try { await btn.click({ timeout: 3000 }); }
-    catch { await btn.click({ timeout: 3000, force: true }); }
-  } else {
-    await page.keyboard.press("Enter");
-  }
+  const btn = page.locator(SELECTORS.sendButton).first();
+  if (await btn.count()) { try { await btn.click({timeout:2500}); } catch { await btn.click({timeout:2500, force:true}); } }
+  else { await page.keyboard.press("Enter"); }
   return true;
 }
 
-/* ========== Bucle principal ========== */
+/* =============== bucle principal =============== */
 async function loop() {
   await ensureBrowser();
   await loginIfNeeded();
 
   while (true) {
-    if (!running) { await page.waitForTimeout(1500); continue; }
+    try {
+      if (!running) { await page.waitForTimeout(1200); continue; }
 
-    await dismissOnboardingWizard(page);
-    await clearOverlays(page);
+      await dismissOnboardingWizard(page);
+      await clearOverlays(page);
 
-    // Si hay botón START CHATTING, púlsalo.
-    if (await tryStartChatting()) { await page.waitForTimeout(1500); continue; }
+      // botón START CHATTING
+      if (await tryStartChatting()) { await page.waitForTimeout(1200); continue; }
 
-    // Si seguimos en cola, espera y reintenta.
-    if (await isQueueVisible()) { await page.waitForTimeout(4000); continue; }
+      // aún en cola → esperar
+      if (await isQueueVisible()) { await page.waitForTimeout(3500); continue; }
 
-    const { chat, perfil } = await getContextText();
-    if (!chat || chat.length < 10) { await page.waitForTimeout(2000); continue; }
+      const { chat, perfil } = await getContextText();
+      if (!chat || chat.length < 10) { await page.waitForTimeout(1800); continue; }
 
-    const reply = await generateReply(chat, perfil);
-    const sent  = await sendMessage(reply);
-    if (!sent) { await page.waitForTimeout(2000); continue; }
+      const reply = await generateReply(chat, perfil);
+      const sent = await sendMessage(reply);
+      if (!sent) { await page.waitForTimeout(1800); continue; }
 
-    await page.waitForTimeout(3000 + Math.floor(Math.random() * 2000));
+      await page.waitForTimeout(2800 + Math.floor(Math.random()*1800));
+    } catch (e) {
+      console.error("Loop error:", e?.message || e);
+      // si la página o contexto se cerraron, recrea
+      if (String(e).includes("has been closed")) {
+        try { await context?.close(); } catch {}
+        try { await browser?.close(); } catch {}
+        browser = context = page = null;
+        await ensureBrowser();
+        await loginIfNeeded();
+      } else {
+        await page.waitForTimeout(1200);
+      }
+    }
   }
 }
 
-/* ========== Endpoints control ========== */
-function checkToken(req, res, next) {
-  if (req.query.token !== CONTROL_TOKEN) return res.status(401).send("unauthorized");
-  next();
-}
-app.get("/", (req, res) => res.send("OK"));
-app.get("/health", (req, res) => res.json({ running }));
-app.post("/pause", checkToken, (req, res) => { running = false; res.json({ running }); });
-app.post("/resume", checkToken, (req, res) => { running = true; res.json({ running }); });
-app.get("/screenshot", checkToken, async (req, res) => {
-  if (!page) return res.status(500).send("page not ready");
-  const buf = await page.screenshot({ fullPage: true });
-  res.setHeader("Content-Type", "image/png");
-  res.send(buf);
-});
-app.get("/html", checkToken, async (req, res) => {
-  if (!page) return res.status(500).send("page not ready");
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.send(await page.content());
-});
+/* =============== endpoints control =============== */
+function checkToken(req,res,next){ if(req.query.token!==CONTROL_TOKEN) return res.status(401).send("unauthorized"); next(); }
+app.get("/", (_,res)=>res.send("OK"));
+app.get("/health", (_,res)=>res.json({ running }));
+app.post("/pause", checkToken, (_,res)=>{ running=false; res.json({ running }); });
+app.post("/resume", checkToken, (_,res)=>{ running=true; res.json({ running }); });
+app.get("/screenshot", checkToken, async (_,res)=>{ if(!page) return res.status(500).send("page not ready"); const buf=await page.screenshot({fullPage:true}); res.setHeader("Content-Type","image/png"); res.send(buf); });
+app.get("/html", checkToken, async (_,res)=>{ if(!page) return res.status(500).send("page not ready"); res.setHeader("Content-Type","text/plain; charset=utf-8"); res.send(await page.content()); });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log("Server listening on", port);
-  const run = async () => {
-    try { await loop(); }
-    catch (e) { console.error("Loop error:", e); setTimeout(run, 3000); }
-  };
-  run();
+  (async function run(){ try{ await loop(); } catch(e){ console.error("Top-level error:", e); setTimeout(run, 2000); }})();
 });
