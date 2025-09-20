@@ -103,7 +103,10 @@ async function generateRepair(prev) {
 
 async function ensureBrowser() {
   if (browser) return;
-  browser = await chromium.launch({ headless: true });
+  browser = await chromium.launch({
+  headless: true,
+  args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+});
   context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   page = await context.newPage();
 }
