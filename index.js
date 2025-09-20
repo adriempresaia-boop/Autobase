@@ -25,14 +25,15 @@ app.use(express.json());
 let running = true;
 let browser, context, page;
 
+// mínimo duro (puedes ajustar con variable MIN_CHARS en Railway si quieres)
+const MIN_CHARS = Number(process.env.MIN_CHARS || 190);
+
 const BANNED = [
   "celular", "vos ", "qué rico", "recién", "ahorita", "computadora",
   "cachetadas", "jalar", "platicar", "carro", "papi", "lechita", "coger "
 ];
 
-/* ===========================
-   Helpers de UI / Overlays
-   =========================== */
+/* ========== Utilidades UI / Overlays ========== */
 
 async function clickIfVisible(locator) {
   try {
@@ -56,7 +57,7 @@ async function acceptCookiesAnywhere(p) {
       if (await btn.count()) {
         if (await btn.first().isVisible({ timeout: 500 })) {
           await btn.first().click({ timeout: 2000 });
-          await p.waitForTimeout(400);
+          await p.waitForTimeout(300);
           break;
         }
       }
@@ -64,25 +65,62 @@ async function acceptCookiesAnywhere(p) {
   }
 }
 
-// Quita overlays que interceptan eventos (como claimedNotification)
 async function clearOverlays(p) {
   try {
     await p.evaluate(() => {
       const sels = [
         "[data-testid='claimedNotification']",
         ".chat-claimed-notification",
-        ".toast", ".Toastify", "[role='dialog']",
+        ".toast", ".Toastify", "[role='dialog'][aria-modal='true']",
         ".front-title.d-flex.flex-column.align-center.justify-center"
       ];
       for (const sel of sels) {
         document.querySelectorAll(sel).forEach(el => {
-          el.style.pointerEvents = "none";
-          el.style.display = "none";
-          el.remove?.();
+          try { el.style.pointerEvents = "none"; el.style.display = "none"; el.remove?.(); } catch {}
         });
       }
     });
   } catch {}
+}
+
+/* ——— Wizard “Información importante…” ——— */
+async function dismissOnboardingWizard(p) {
+  for (let i = 0; i < 12; i++) {
+    await acceptCookiesAnywhere(p);
+    const closeBtn = p.getByRole("button", { name: /close|cerrar|entendido|hecho|ok/i });
+    if (await closeBtn.count()) {
+      try { await closeBtn.first().click({ timeout: 1500 }); } catch {}
+      await p.waitForTimeout(200);
+    }
+    const nextBtn = p.getByRole("button", { name: /next|siguiente/i });
+    if (await nextBtn.count()) {
+      try { await nextBtn.first().click({ timeout: 1500 }); } catch {}
+      await p.waitForTimeout(200);
+      continue;
+    }
+    const wizardVisible =
+      await p.getByText(/información importante sobre expresiones/i).first().isVisible().catch(()=>false);
+    if (!wizardVisible) break;
+    await p.waitForTimeout(200);
+  }
+}
+
+/* ========== Navegador y login ========== */
+
+async function ensureBrowser() {
+  if (browser) return;
+  browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+  });
+  context = await browser.newContext({
+    viewport: { width: 1366, height: 900 },
+    locale: "es-ES",
+    timezoneId: "Europe/Madrid",
+    userAgent:
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  });
+  page = await context.newPage();
 }
 
 async function findEmailInput(p) {
@@ -107,83 +145,72 @@ async function findSubmitButton(p) {
   return null;
 }
 
-async function smartFillInAnyFrame() {
-  const all = [page, ...page.frames()];
-  for (const ctx of all) {
-    try {
-      await clearOverlays(ctx);
-      const email = await findEmailInput(ctx);
-      const pass  = await findPasswordInput(ctx);
-      if (email && pass) {
-        await email.click({ timeout: 3000 });
-        await email.fill(EMAIL, { timeout: 3000 });
-        await pass.click({ timeout: 3000 });
-        await pass.fill(PASSWORD, { timeout: 3000 });
-        const btn = await findSubmitButton(ctx);
-        if (btn) { await btn.click({ timeout: 3000 }); return true; }
-        await pass.press("Enter");
-        return true;
-      }
-    } catch {}
-  }
-  return false;
-}
-
-/* ===========================
-   Navegador y Login
-   =========================== */
-
-async function ensureBrowser() {
-  if (browser) return;
-  browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-  });
-  context = await browser.newContext({
-    viewport: { width: 1366, height: 900 },
-    locale: "es-ES",
-    timezoneId: "Europe/Madrid",
-    userAgent:
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-  });
-  page = await context.newPage();
-}
-
 async function loginIfNeeded() {
   await page.goto(BASE_URL, { waitUntil: "domcontentloaded" });
   await acceptCookiesAnywhere(page);
+  await dismissOnboardingWizard(page);
   await clearOverlays(page);
 
-  // ¿Ya estamos dentro?
-  if (await page.locator("text=Waiting for conversation to be claimed").first().isVisible().catch(()=>false)) return;
+  const waitingSel = "text=Waiting for conversation to be claimed";
+  if (await page.locator(waitingSel).first().isVisible().catch(()=>false)) return;
 
-  // A veces hay "CHAT" o un botón para abrir el login
   await clickIfVisible(page.getByText(/^CHAT$/i));
   await clickIfVisible(page.getByRole("button", { name: /login|entrar|iniciar sesión|sign in/i }));
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(400);
   await acceptCookiesAnywhere(page);
   await clearOverlays(page);
 
-  // Intenta rellenar
-  const done = await smartFillInAnyFrame();
-  if (!done) {
-    const deadline = Date.now() + 35000;
-    while (Date.now() < deadline) {
-      await clearOverlays(page);
-      if (await smartFillInAnyFrame()) break;
+  const all = [page, ...page.frames()];
+  const deadline = Date.now() + 35000;
+  let done = false;
+  while (!done && Date.now() < deadline) {
+    for (const ctx of all) {
+      try {
+        await clearOverlays(ctx);
+        const email = await findEmailInput(ctx);
+        const pass  = await findPasswordInput(ctx);
+        if (email && pass) {
+          await email.click({ timeout: 3000 }); await email.fill(EMAIL, { timeout: 3000 });
+          await pass .click({ timeout: 3000 }); await pass .fill(PASSWORD, { timeout: 3000 });
+          const btn = await findSubmitButton(ctx);
+          if (btn) await btn.click({ timeout: 3000 }); else await pass.press("Enter");
+          done = true;
+          break;
+        }
+      } catch {}
+    }
+    if (!done) {
       await clickIfVisible(page.getByRole("button", { name: /email/i }));
       await clickIfVisible(page.getByText(/email/i));
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(800);
     }
   }
 
   await page.waitForLoadState("domcontentloaded");
-  await page.waitForTimeout(1000);
+  await dismissOnboardingWizard(page);
+  await clearOverlays(page);
+  await page.waitForTimeout(600);
 }
 
-/* ===========================
-   Extracción, generación, envío
-   =========================== */
+/* ========== Chat: extracción / generación / envío ========== */
+
+const SELECTORS = {
+  waiting: "text=Waiting for conversation to be claimed",
+  chatArea: "main, div[role='main'], div[data-testid='chat']",
+  inputCandidates: [
+    "textarea",
+    "div[contenteditable='true']",
+    "[role='textbox']",
+    "textarea[placeholder*='message' i]",
+    "textarea[placeholder*='mensaje' i]",
+    "textarea[placeholder*='escribe' i]",
+    "input[name*='message' i]",
+    "div[data-testid*='input' i]",
+    "div[data-placeholder*='mensaje' i]",
+    "div[data-placeholder*='message' i]"
+  ],
+  sendButton: "button:has-text('Send'), [aria-label='Send'], [data-testid='send'], button:has-text('Enviar')"
+};
 
 async function extractText(selector) {
   return page.evaluate((sel) => {
@@ -192,16 +219,8 @@ async function extractText(selector) {
   }, selector);
 }
 
-const SELECTORS = {
-  waiting: "text=Waiting for conversation to be claimed",
-  chatArea: "main, div[role='main'], div[data-testid='chat']",
-  inputBox: "textarea, div[contenteditable='true']",
-  sendButton: "button:has-text('Send'), [aria-label='Send'], [data-testid='send'], button:has-text('Enviar')"
-};
-
 async function getContextText() {
   const chatText = await extractText(SELECTORS.chatArea);
-
   let perfil = "";
   try {
     perfil = await page.evaluate(() => {
@@ -216,12 +235,33 @@ async function getContextText() {
   return { chat: trimmedChat, perfil };
 }
 
+// --- asegura longitud mínima y pregunta final ---
+function ensureMinLength(text) {
+  const fillers = [
+    " Me gusta hablar con calma y con buen rollo; así nos conocemos mejor y sale todo más natural.",
+    " Cuéntame algo de tu día o qué te apetece ahora mismo; me hace ilusión saberlo y seguir charlando contigo."
+  ];
+  let out = text.trim();
+
+  // Si no termina en ?, añade una pregunta abierta al final
+  if (!/[?？]\s*$/.test(out)) {
+    out = out.replace(/[.!…]*\s*$/, "");
+    out += " ¿Tú qué opinas?";
+  }
+
+  while (out.length < MIN_CHARS) {
+    out += fillers[(out.length / 80) % fillers.length | 0];
+    if (!/[?？]\s*$/.test(out)) out += " ¿Qué te gustaría ahora?";
+  }
+  return out;
+}
+
 function buildPrompt({ chat, perfil }) {
   return `
 Actúa como el personaje indicado y responde en español de España con tono cercano y sugerente sin ser explícito.
 Cumple SIEMPRE: no insultos, no quedar en persona, no revelar identidad real, evita regionalismos de LATAM
 (celular, vos, qué rico, recién, ahorita, computadora, etc.).
-Longitud objetivo: 170–210 caracteres (mínimo 150). Termina SIEMPRE con una pregunta abierta.
+Longitud objetivo: 220–260 caracteres (si queda corto, alarga con frases naturales). Termina SIEMPRE con una pregunta abierta.
 
 Personaje (panel "YOU ARE"):
 ${perfil || "No disponible"}
@@ -247,10 +287,14 @@ async function generateReply(chat, perfil) {
   });
   const data = await res.json();
   let text = data?.choices?.[0]?.message?.content?.trim() || "";
-  if (text.length < 150) text += " ¿Tú cómo lo ves?";
+  text = ensureMinLength(text);
+
   const lower = text.toLowerCase();
-  for (const w of BANNED) if (lower.includes(w)) return generateRepair(text);
-  return text;
+  for (const w of BANNED) if (lower.includes(w)) {
+    text = await generateRepair(text);
+    break;
+  }
+  return ensureMinLength(text); // segunda pasada por si reescribe corto
 }
 
 async function generateRepair(prev) {
@@ -259,7 +303,7 @@ async function generateRepair(prev) {
     temperature: 0.6,
     messages: [
       { role: "system", content: "Reescribe a español de España, sin regionalismos LATAM, cumpliendo normas." },
-      { role: "user", content: `Reformula esto a 170–210 caracteres y termina con pregunta abierta:\n${prev}` }
+      { role: "user", content: `Reformula esto a 220–260 caracteres y termina con pregunta abierta:\n${prev}` }
     ]
   };
   const res = await fetchFn("https://api.openai.com/v1/chat/completions", {
@@ -268,27 +312,51 @@ async function generateRepair(prev) {
     body: JSON.stringify(body)
   });
   const data = await res.json();
-  return data?.choices?.[0]?.message?.content?.trim() || prev;
+  return ensureMinLength(data?.choices?.[0]?.message?.content?.trim() || prev);
+}
+
+async function findInputHandle() {
+  await clearOverlays(page);
+  for (const sel of SELECTORS.inputCandidates) {
+    const h = await page.locator(sel).last();
+    if (await h.count()) {
+      try { if (await h.isVisible({ timeout: 200 })) return h; } catch {}
+    }
+  }
+  return null;
+}
+
+async function waitForInput(ms = 9000) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    const h = await findInputHandle();
+    if (h) return h;
+    await page.waitForTimeout(300);
+  }
+  return null;
 }
 
 async function sendMessage(text) {
-  await clearOverlays(page);
-  const input = await page.locator(SELECTORS.inputBox).first();
-  if (!(await input.count())) throw new Error("No encuentro el cuadro de texto.");
-  await input.click({ timeout: 3000, force: true });
-  await input.fill(text);
+  await dismissOnboardingWizard(page);
+  const input = await waitForInput(9000);
+  if (!input) { console.log("Input no disponible; reintento más tarde."); return false; }
 
   await clearOverlays(page);
-  const btn =
-    (await page.locator(SELECTORS.sendButton).first()) ||
-    null;
-  if (btn && (await btn.count())) {
+  try { await input.click({ timeout: 3000, force: true }); } catch {}
+  try { await input.fill(text); } catch { await page.keyboard.type(text); }
+
+  await clearOverlays(page);
+  const btn = await page.locator(SELECTORS.sendButton).first();
+  if (await btn.count()) {
     try { await btn.click({ timeout: 3000 }); }
     catch { await btn.click({ timeout: 3000, force: true }); }
   } else {
     await page.keyboard.press("Enter");
   }
+  return true;
 }
+
+/* ========== Bucle principal ========== */
 
 async function loop() {
   await ensureBrowser();
@@ -297,7 +365,9 @@ async function loop() {
   while (true) {
     if (!running) { await page.waitForTimeout(1500); continue; }
 
-    if (await page.locator(SELECTORS.waiting).first().isVisible().catch(()=>false)) {
+    await dismissOnboardingWizard(page);
+
+    if (await page.locator("text=Waiting for conversation to be claimed").first().isVisible().catch(()=>false)) {
       await clearOverlays(page);
       await page.waitForTimeout(4000);
       continue;
@@ -307,15 +377,14 @@ async function loop() {
     if (!chat || chat.length < 10) { await page.waitForTimeout(2000); continue; }
 
     const reply = await generateReply(chat, perfil);
-    await sendMessage(reply);
+    const sent  = await sendMessage(reply);
+    if (!sent) { await page.waitForTimeout(2000); continue; }
 
     await page.waitForTimeout(3000 + Math.floor(Math.random() * 2000));
   }
 }
 
-/* ===========================
-   Endpoints control
-   =========================== */
+/* ========== Endpoints control ========== */
 
 function checkToken(req, res, next) {
   if (req.query.token !== CONTROL_TOKEN) return res.status(401).send("unauthorized");
