@@ -1,7 +1,6 @@
 {
   "name": "autobase",
   "version": "1.0.0",
-  "type": "module",
   "engines": { "node": ">=18.17" },
   "dependencies": {
     "dotenv": "^16.4.5",
