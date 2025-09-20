@@ -2,12 +2,11 @@ require("dotenv").config();
 const express = require("express");
 const { chromium } = require("playwright");
 
-// FETCH robusto (sin top-level await)
+// FETCH robusto
 const fetchFn = globalThis.fetch
   ? (...args) => globalThis.fetch(...args)
   : (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
-// No tumbar el contenedor en errores no capturados
 process.on("unhandledRejection", (e) => console.error("UNHANDLED_REJECTION", e));
 process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
 
@@ -26,18 +25,20 @@ app.use(express.json());
 let running = true;
 let browser, context, page;
 
-// Lista básica de palabras/expresiones vetadas por la plataforma (amplía si quieres)
 const BANNED = [
   "celular", "vos ", "qué rico", "recién", "ahorita", "computadora",
   "cachetadas", "jalar", "platicar", "carro", "papi", "lechita", "coger "
 ];
 
-// ---------- Helpers de login ----------
+/* ===========================
+   Helpers de UI / Overlays
+   =========================== */
 
 async function clickIfVisible(locator) {
   try {
-    if (await locator.first().isVisible({ timeout: 500 })) {
-      await locator.first().click({ timeout: 2000 });
+    const el = locator.first();
+    if (await el.isVisible({ timeout: 500 })) {
+      await el.click({ timeout: 2000 });
       return true;
     }
   } catch {}
@@ -55,7 +56,7 @@ async function acceptCookiesAnywhere(p) {
       if (await btn.count()) {
         if (await btn.first().isVisible({ timeout: 500 })) {
           await btn.first().click({ timeout: 2000 });
-          await p.waitForTimeout(500);
+          await p.waitForTimeout(400);
           break;
         }
       }
@@ -63,11 +64,30 @@ async function acceptCookiesAnywhere(p) {
   }
 }
 
+// Quita overlays que interceptan eventos (como claimedNotification)
+async function clearOverlays(p) {
+  try {
+    await p.evaluate(() => {
+      const sels = [
+        "[data-testid='claimedNotification']",
+        ".chat-claimed-notification",
+        ".toast", ".Toastify", "[role='dialog']",
+        ".front-title.d-flex.flex-column.align-center.justify-center"
+      ];
+      for (const sel of sels) {
+        document.querySelectorAll(sel).forEach(el => {
+          el.style.pointerEvents = "none";
+          el.style.display = "none";
+          el.remove?.();
+        });
+      }
+    });
+  } catch {}
+}
+
 async function findEmailInput(p) {
-  // Busca por accesibilidad
   let el = p.getByRole("textbox", { name: /email/i });
   if (await el.count()) return el.first();
-  // Busca por placeholder
   el = p.locator('input[placeholder*="email" i], input[name*="email" i], input[type="email"]');
   if (await el.count()) return el.first();
   return null;
@@ -88,18 +108,19 @@ async function findSubmitButton(p) {
 }
 
 async function smartFillInAnyFrame() {
-  // prueba en la página y en todos los iframes (Auth0, etc.)
   const all = [page, ...page.frames()];
   for (const ctx of all) {
     try {
+      await clearOverlays(ctx);
       const email = await findEmailInput(ctx);
       const pass  = await findPasswordInput(ctx);
       if (email && pass) {
-        await email.click({ timeout: 3000 }); await email.fill(EMAIL, { timeout: 3000 });
-        await pass.click({ timeout: 3000 });  await pass.fill(PASSWORD, { timeout: 3000 });
+        await email.click({ timeout: 3000 });
+        await email.fill(EMAIL, { timeout: 3000 });
+        await pass.click({ timeout: 3000 });
+        await pass.fill(PASSWORD, { timeout: 3000 });
         const btn = await findSubmitButton(ctx);
         if (btn) { await btn.click({ timeout: 3000 }); return true; }
-        // Si no hay botón, prueba Enter
         await pass.press("Enter");
         return true;
       }
@@ -108,7 +129,9 @@ async function smartFillInAnyFrame() {
   return false;
 }
 
-// ---------- Navegador y login ----------
+/* ===========================
+   Navegador y Login
+   =========================== */
 
 async function ensureBrowser() {
   if (browser) return;
@@ -129,39 +152,38 @@ async function ensureBrowser() {
 async function loginIfNeeded() {
   await page.goto(BASE_URL, { waitUntil: "domcontentloaded" });
   await acceptCookiesAnywhere(page);
+  await clearOverlays(page);
 
   // ¿Ya estamos dentro?
   if (await page.locator("text=Waiting for conversation to be claimed").first().isVisible().catch(()=>false)) return;
 
-  // A veces hay que pulsar "CHAT" primero
+  // A veces hay "CHAT" o un botón para abrir el login
   await clickIfVisible(page.getByText(/^CHAT$/i));
-
-  // Despliegue de formulario si hay "Login/Entrar/Sign in"
   await clickIfVisible(page.getByRole("button", { name: /login|entrar|iniciar sesión|sign in/i }));
   await page.waitForTimeout(500);
   await acceptCookiesAnywhere(page);
+  await clearOverlays(page);
 
-  // Intenta rellenar en la página o en iframes
+  // Intenta rellenar
   const done = await smartFillInAnyFrame();
   if (!done) {
-    // Reintenta esperando que aparezcan campos (hasta 35s)
     const deadline = Date.now() + 35000;
     while (Date.now() < deadline) {
+      await clearOverlays(page);
       if (await smartFillInAnyFrame()) break;
-      // Si hay un enlace para “Continuar con email”
       await clickIfVisible(page.getByRole("button", { name: /email/i }));
       await clickIfVisible(page.getByText(/email/i));
       await page.waitForTimeout(1000);
     }
   }
 
-  // Espera a que estemos ya en la cola o en el chat
   await page.waitForLoadState("domcontentloaded");
   await page.waitForTimeout(1000);
-  // No falles si no aparece; seguimos en el loop
 }
 
-// ---------- Extracción y envío ----------
+/* ===========================
+   Extracción, generación, envío
+   =========================== */
 
 async function extractText(selector) {
   return page.evaluate((sel) => {
@@ -180,7 +202,6 @@ const SELECTORS = {
 async function getContextText() {
   const chatText = await extractText(SELECTORS.chatArea);
 
-  // Panel "YOU ARE"
   let perfil = "";
   try {
     perfil = await page.evaluate(() => {
@@ -195,7 +216,6 @@ async function getContextText() {
   return { chat: trimmedChat, perfil };
 }
 
-// Prompt maestro
 function buildPrompt({ chat, perfil }) {
   return `
 Actúa como el personaje indicado y responde en español de España con tono cercano y sugerente sin ser explícito.
@@ -209,8 +229,7 @@ ${perfil || "No disponible"}
 Últimos mensajes:
 ${chat || "No disponible"}
 
-Da SOLO la respuesta final, sin comillas.`;
-}
+Da SOLO la respuesta final, sin comillas.`; }
 
 async function generateReply(chat, perfil) {
   const body = {
@@ -223,20 +242,14 @@ async function generateReply(chat, perfil) {
   };
   const res = await fetchFn("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
+    headers: { "Authorization": `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
   const data = await res.json();
   let text = data?.choices?.[0]?.message?.content?.trim() || "";
-
   if (text.length < 150) text += " ¿Tú cómo lo ves?";
   const lower = text.toLowerCase();
-  for (const w of BANNED) {
-    if (lower.includes(w)) return generateRepair(text);
-  }
+  for (const w of BANNED) if (lower.includes(w)) return generateRepair(text);
   return text;
 }
 
@@ -251,10 +264,7 @@ async function generateRepair(prev) {
   };
   const res = await fetchFn("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
+    headers: { "Authorization": `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
   const data = await res.json();
@@ -262,13 +272,22 @@ async function generateRepair(prev) {
 }
 
 async function sendMessage(text) {
-  const input = await page.$(SELECTORS.inputBox);
-  if (!input) throw new Error("No encuentro el cuadro de texto.");
-  await input.click();
+  await clearOverlays(page);
+  const input = await page.locator(SELECTORS.inputBox).first();
+  if (!(await input.count())) throw new Error("No encuentro el cuadro de texto.");
+  await input.click({ timeout: 3000, force: true });
   await input.fill(text);
-  const btn = await page.$(SELECTORS.sendButton);
-  if (btn) await btn.click();
-  else await page.keyboard.press("Enter");
+
+  await clearOverlays(page);
+  const btn =
+    (await page.locator(SELECTORS.sendButton).first()) ||
+    null;
+  if (btn && (await btn.count())) {
+    try { await btn.click({ timeout: 3000 }); }
+    catch { await btn.click({ timeout: 3000, force: true }); }
+  } else {
+    await page.keyboard.press("Enter");
+  }
 }
 
 async function loop() {
@@ -279,26 +298,25 @@ async function loop() {
     if (!running) { await page.waitForTimeout(1500); continue; }
 
     if (await page.locator(SELECTORS.waiting).first().isVisible().catch(()=>false)) {
-      // En la cola: espera y sigue
+      await clearOverlays(page);
       await page.waitForTimeout(4000);
       continue;
     }
 
     const { chat, perfil } = await getContextText();
-    if (!chat || chat.length < 10) {
-      await page.waitForTimeout(2000);
-      continue;
-    }
+    if (!chat || chat.length < 10) { await page.waitForTimeout(2000); continue; }
 
     const reply = await generateReply(chat, perfil);
     await sendMessage(reply);
 
-    // Ritmo humano
     await page.waitForTimeout(3000 + Math.floor(Math.random() * 2000));
   }
 }
 
-// ---------- Endpoints control ----------
+/* ===========================
+   Endpoints control
+   =========================== */
+
 function checkToken(req, res, next) {
   if (req.query.token !== CONTROL_TOKEN) return res.status(401).send("unauthorized");
   next();
