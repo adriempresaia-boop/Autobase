@@ -68,10 +68,8 @@ async function dismissOnboarding(){
       if (await close.count()){ await close.first().click(); await sleep(250); continue; }
       const next = page.locator('button:has-text("NEXT"), button:has-text("Next"), button:has-text("Siguiente")');
       if (await next.count()){ await next.first().click(); await sleep(250); continue; }
-      // Por si tiene botón “OK” o “Entendido”
       const ok = page.locator('button:has-text("OK"), button:has-text("Ok"), button:has-text("Entendido")');
       if (await ok.count()){ await ok.first().click(); await sleep(250); continue; }
-      // Si nada responde, intenta Esc
       await page.keyboard.press('Escape');
       await sleep(200);
     } else break;
@@ -92,13 +90,36 @@ async function dismissPasteWarning(){
   }
 }
 
+// NUEVO: cerrar overlay “You have a chat claimed” tocando la pantalla
+async function dismissClaimedOverlay(){
+  try{
+    const claim = page.locator('[data-testid="claimedNotification"], .claimed-notification, .chat-claimed-notification, text=/You have a chat claimed/i');
+    if (await claim.count()){
+      // intenta botón de cierre si existe
+      const closeBtn = claim.locator('button:has-text("close"), button:has-text("CLOSE"), button:has-text("ok"), button:has-text("OK"), button:has-text("Cerrar")');
+      if (await closeBtn.count()){
+        await closeBtn.first().click().catch(()=>{});
+      } else {
+        // clic al centro del overlay; si no hay bbox, al centro de la página
+        const bb = await claim.first().boundingBox().catch(()=>null);
+        if (bb){
+          await page.mouse.click(bb.x + bb.width/2, bb.y + bb.height/2).catch(()=>{});
+        }else{
+          const v = page.viewportSize() || {width: 1200, height: 800};
+          await page.mouse.click(Math.floor(v.width/2), Math.floor(v.height/2)).catch(()=>{});
+        }
+      }
+      await sleep(150);
+    }
+  }catch{}
+}
+
 /* ---------------- leer últimos mensajes (solo centro) ---------------- */
 async function getRecentMessages(){
   const js = `
   (() => {
     const qs = (s, r=document) => Array.from(r.querySelectorAll(s));
     const isAside = n => !!n.closest('aside,[role="complementary"],.sidebar,[class*="side"]');
-    // contenedores de mensajes habituales
     const containers = qs('main .messages, main .chat, .chat-area, .conversation, [data-testid*="chat"], [class*="chat-body"], [class*="messages"]')
       .filter(c => !isAside(c));
     const root = containers[0] || document.querySelector('main') || document.body;
@@ -110,19 +131,17 @@ async function getRecentMessages(){
       .split(/\\n+/)
       .map(x => x.trim())
       .filter(Boolean)
-      // filtra paneles laterales conocidos
       .filter(l => !/^PROFILE DETAILS|^ADD NEW LOG|^SEXUAL PREFERENCES|^UPDATES|^FAMILY|^PERSONAL INFO|^WORK|^OTHER/i.test(l));
     return lines.slice(-40).join('\\n');
   })();`;
   const raw = await page.evaluate(js);
   const lines = raw.split('\n').filter(Boolean);
-  const chunk = lines.slice(-12).join('\n'); // 4-6 mensajes aprox.
+  const chunk = lines.slice(-12).join('\n');
   return chunk;
 }
 
 /* ------------- generación simple sin LLM ------------- */
 function genFallback(replyTo){
-  // Extrae la última pregunta si existe
   let question = '¿Qué te parece a ti?';
   const lastQ = replyTo.split('?').slice(-2)[0];
   if (replyTo.includes('?') && lastQ) {
@@ -148,12 +167,10 @@ async function buildReply(){
 /* ------------- tecleo humano (nada de paste/clear) ------------- */
 async function typeHuman(textarea, text){
   await textarea.click({ delay: 40 });
-  // “despertar” el detector anti-paste
   await page.keyboard.type(' ', { delay: rand(10,30) });
-
   for (const ch of text){
     await page.keyboard.type(ch, { delay: rand(25,70) });
-    if (Math.random() < 0.05) await sleep(rand(60,160)); // mini pausa
+    if (Math.random() < 0.05) await sleep(rand(60,160));
   }
 }
 
@@ -167,7 +184,6 @@ async function loginIfNeeded(){
     const emailBox = await waitVisibleAny(page, ['input[type="email"]','input[name="email"]','input[autocomplete="username"]'], 15000);
     const passBox  = await waitVisibleAny(page, ['input[type="password"]','input[name="password"]','input[autocomplete="current-password"]'], 15000);
     await emailBox.click();
-    // no usar .fill en el chat, pero aquí sí para login
     await emailBox.fill(EMAIL);
     await passBox.click();
     await passBox.fill(PASSWORD);
@@ -178,6 +194,8 @@ async function loginIfNeeded(){
 
   // Carrusel/avisos
   await dismissOnboarding();
+  // NUEVO: cerrar overlay de “chat claimed”
+  await dismissClaimedOverlay();
 
   // Botón “Start chatting” si aparece
   try{
@@ -188,9 +206,10 @@ async function loginIfNeeded(){
 
 /* ---------------- envío ---------------- */
 async function typeAndSend(text){
-  // si hay modal, ciérralo
   await dismissOnboarding();
   await dismissPasteWarning();
+  // NUEVO: por si aparece justo al cambiar de chat
+  await dismissClaimedOverlay();
 
   const box = await waitVisibleAny(
     page,
@@ -198,19 +217,14 @@ async function typeAndSend(text){
     12000
   );
 
-  // escribir (¡sin borrar nada!)
   await typeHuman(box, text);
 
-  // ---------- envío robusto ----------
   const probe = text.slice(0, Math.min(45, text.length)).trim();
   const prevLen = await box.evaluate(el => ((el.value || el.innerText || '').trim().length)).catch(()=>0);
 
-  // función de verificación: mensaje enviado si vacío o aparece el texto
   const wasSent = async () => {
-    // compositor vacío tras enviar
     const len = await box.evaluate(el => ((el.value || el.innerText || '').trim().length)).catch(()=>0);
     if (len === 0 || len < Math.min(4, Math.floor(prevLen*0.3))) return true;
-    // texto visible en el timeline
     try{
       const ok = await page.evaluate(s => document.body && document.body.innerText.includes(s), probe);
       if (ok) return true;
@@ -218,7 +232,6 @@ async function typeAndSend(text){
     return false;
   };
 
-  // 1) clic en botón enviar (más selectores)
   const sendBtn = page.locator([
     'button:has-text("enviar")',
     'button:has-text("ENVIAR")',
@@ -239,7 +252,6 @@ async function typeAndSend(text){
     if (await wasSent()) return true;
   }
 
-  // 2) teclas: Enter → Ctrl+Enter → Meta+Enter
   for (const key of ['Enter','Control+Enter','Meta+Enter']){
     await page.keyboard.press(key).catch(()=>{});
     await sleep(600);
@@ -247,7 +259,6 @@ async function typeAndSend(text){
     if (await wasSent()) return true;
   }
 
-  // 3) último intento: clic + Enter
   if (await sendBtn.count()){
     await sendBtn.first().click({ timeout: 2500 }).catch(()=>{});
     await sleep(400);
@@ -256,7 +267,6 @@ async function typeAndSend(text){
     if (await wasSent()) return true;
   }
 
-  // si nada funcionó, devolvemos false sin borrar lo escrito
   return false;
 }
 
@@ -283,10 +293,9 @@ async function loop(){
       await ensureAlive();
       await loginIfNeeded();
 
-      // cierra onboarding si vuelve a salir
       await dismissOnboarding();
+      await dismissClaimedOverlay();
 
-      // lee contexto y redacta
       const recent = await getRecentMessages();
       const reply = await buildReply();
       const h = hash(recent + '||' + reply);
@@ -298,7 +307,6 @@ async function loop(){
       console.error('Loop error:', e.message);
     }
 
-    // si llevamos mucho sin poder escribir (bloqueos), refresca
     if (Date.now() - lastOkAt > 120000){
       try{ await page.reload({ waitUntil:'domcontentloaded', timeout:20000 }); }catch{}
       lastOkAt = Date.now();
