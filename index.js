@@ -1,11 +1,16 @@
 require("dotenv").config();
 const express = require("express");
 const { chromium } = require("playwright");
-// Polyfill de fetch en Node (si no existe)
-let fetch = global.fetch;
-if (!fetch) {
-  fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-}
+
+// FETCH robusto (sin top-level await)
+const fetchFn = globalThis.fetch
+  ? (...args) => globalThis.fetch(...args)
+  : (...args) => import("node-fetch").then(({ default: f }) => f(...args));
+
+// No tumbar el contenedor en errores no capturados
+process.on("unhandledRejection", (e) => console.error("UNHANDLED_REJECTION", e));
+process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
+
 const {
   EMAIL,
   PASSWORD,
@@ -21,41 +26,40 @@ app.use(express.json());
 let running = true;
 let browser, context, page;
 
-// Lista básica de palabras/expresiones vetadas por la plataforma (puedes ampliar)
+// Lista básica de palabras/expresiones vetadas por la plataforma (amplía si quieres)
 const BANNED = [
   "celular", "vos ", "qué rico", "recién", "ahorita", "computadora",
-  "cachetadas", "jalar", "platicar", "carro", "papi", "lechita",
-  "coger" // en sentido sexual; el modelo ya entiende el matiz si se lo pides
+  "cachetadas", "jalar", "platicar", "carro", "papi", "lechita", "coger "
 ];
 
-// Prompt maestro: español de España + 150+ caracteres + terminar con pregunta abierta
+// Prompt maestro
 function buildPrompt({ chat, perfil }) {
   return `
-Actúa como el personaje indicado y responde en **español de España** con tono cercano y sugerente sin ser explícito.
+Actúa como el personaje indicado y responde en español de España con tono cercano y sugerente sin ser explícito.
 Cumple SIEMPRE: no insultos, no quedar en persona, no revelar identidad real, evita regionalismos de LATAM
 (celular, vos, qué rico, recién, ahorita, computadora, etc.).
 Longitud objetivo: 170–210 caracteres (mínimo 150). Termina SIEMPRE con una pregunta abierta.
 
-Personaje (lo que ves en "YOU ARE"):
+Personaje (panel "YOU ARE"):
 ${perfil || "No disponible"}
 
-Últimos mensajes (formato texto plano):
+Últimos mensajes:
 ${chat || "No disponible"}
 
-Da SOLO la respuesta final, sin comillas, lista para pegar.`;
+Da SOLO la respuesta final, sin comillas.`;
 }
 
-// Llama al LLM (OpenAI Chat Completions compatible)
+// Llama al LLM
 async function generateReply(chat, perfil) {
   const body = {
     model: MODEL,
     temperature: 0.7,
     messages: [
-      { role: "system", content: "Eres un asistente que escribe español de España, siguiendo normas del chat." },
+      { role: "system", content: "Escribe español de España. Cumple normas: sin insultos, sin quedadas, sin identidad real." },
       { role: "user", content: buildPrompt({ chat, perfil }) }
     ]
   };
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+  const res = await fetchFn("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${OPENAI_API_KEY}`,
@@ -66,30 +70,26 @@ async function generateReply(chat, perfil) {
   const data = await res.json();
   let text = data?.choices?.[0]?.message?.content?.trim() || "";
 
-  // Post-filtro: longitud y palabras vetadas
-  if (text.length < 150) {
-    text += " ¿Y tú qué opinas?"; // estira un poco si se quedó corto
-  }
+  // Post-filtro
+  if (text.length < 150) text += " ¿Tú cómo lo ves?";
   const lower = text.toLowerCase();
   for (const w of BANNED) {
-    if (lower.includes(w)) {
-      // Reescribe pidiendo español de España
-      return generateRepair(text);
-    }
+    if (lower.includes(w)) return generateRepair(text);
   }
   return text;
 }
 
+// Reparación si detectamos palabras vetadas
 async function generateRepair(prev) {
   const body = {
     model: MODEL,
     temperature: 0.6,
     messages: [
-      { role: "system", content: "Reescribe a español de España cumpliendo normas y evita regionalismos LATAM." },
-      { role: "user", content: `Reformula este texto manteniendo el sentido, 170–210 caracteres, termina con pregunta abierta:\n${prev}` }
+      { role: "system", content: "Reescribe a español de España, sin regionalismos LATAM, cumpliendo normas." },
+      { role: "user", content: `Reformula esto a 170–210 caracteres y termina con pregunta abierta:\n${prev}` }
     ]
   };
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+  const res = await fetchFn("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${OPENAI_API_KEY}`,
@@ -104,9 +104,9 @@ async function generateRepair(prev) {
 async function ensureBrowser() {
   if (browser) return;
   browser = await chromium.launch({
-  headless: true,
-  args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-});
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+  });
   context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   page = await context.newPage();
 }
@@ -114,26 +114,26 @@ async function ensureBrowser() {
 async function loginIfNeeded() {
   await page.goto(BASE_URL, { waitUntil: "domcontentloaded" });
 
-  // Intenta detectar si ya está logueado (selector de espera)
+  // ¿Ya estamos en la pantalla de espera?
   const waitingSelector = "text=Waiting for conversation to be claimed";
   const isWaiting = await page.$(waitingSelector);
   if (isWaiting) return;
 
-  // Rellena login (ajusta selectores si cambian)
+  // Rellena login (ajusta si cambian los selectores)
   const emailSel = 'input[type="email"], input[name="email"]';
-  const passSel = 'input[type="password"], input[name="password"]';
-  await page.waitForSelector(emailSel, { timeout: 15000 });
+  const passSel  = 'input[type="password"], input[name="password"]';
+  await page.waitForSelector(emailSel, { timeout: 20000 });
   await page.fill(emailSel, EMAIL);
   await page.fill(passSel, PASSWORD);
 
-  // Botón de entrar (ajusta el texto si es distinto)
-  const loginButton = await page.$('button:has-text("Login"), button:has-text("Iniciar sesión")');
-  if (loginButton) {
-    await loginButton.click();
-  } else {
-    // Si no encuentra botón, prueba Enter
-    await page.press(passSel, "Enter");
-  }
+  // Botón entrar (cubre varias variantes)
+  const loginButton =
+    (await page.$('button:has-text("Login")')) ||
+    (await page.$('button:has-text("Iniciar sesión")')) ||
+    (await page.$('button:has-text("Entrar")')) ||
+    (await page.$('button[type="submit"]'));
+  if (loginButton) await loginButton.click();
+  else await page.press(passSel, "Enter");
 
   await page.waitForLoadState("domcontentloaded");
 }
@@ -145,49 +145,44 @@ async function extractText(selector) {
   }, selector);
 }
 
-// Configurable: ajusta estas rutas si cambian
+// Selectores (ajústalos si cambia la UI)
 const SELECTORS = {
   waiting: "text=Waiting for conversation to be claimed",
-  chatArea: "main, div[role='main'], div[data-testid='chat']", // área central
-  youArePanel: "text=YOU ARE", // punto de anclaje; luego cogemos el bloque cercano
+  chatArea: "main, div[role='main'], div[data-testid='chat']",
   inputBox: "textarea, div[contenteditable='true']",
   sendButton: "button:has-text('Send'), [aria-label='Send'], [data-testid='send']"
 };
 
 async function getContextText() {
-  // Intenta sacar todo el texto del área de chat
   const chatText = await extractText(SELECTORS.chatArea);
-  // Intenta sacar el panel de "YOU ARE" (puede requerir ajustar)
+
+  // Panel "YOU ARE": buscamos por texto y cogemos el contenedor cercano
   let perfil = "";
   try {
     perfil = await page.evaluate(() => {
       const node = Array.from(document.querySelectorAll("*"))
         .find(n => /YOU ARE/i.test(n.innerText || ""));
       if (!node) return "";
-      // Coge el contenedor padre cercano
       const box = node.closest("aside") || node.parentElement;
       return box ? box.innerText : node.innerText;
     });
   } catch { /* ignore */ }
 
-  // Recorta a lo último para no mandar demasiado texto
-  const trimmedChat = chatText.split("\n").slice(-40).join("\n");
+  const trimmedChat = (chatText || "").split("\n").slice(-40).join("\n");
   return { chat: trimmedChat, perfil };
 }
 
 async function sendMessage(text) {
-  // Escribe y envía
   const input = await page.$(SELECTORS.inputBox);
   if (!input) throw new Error("No encuentro el cuadro de texto.");
   await input.click();
   await input.fill(text);
-  const btn = await page.$(SELECTORS.sendButton);
-  if (btn) {
-    await btn.click();
-    // A veces Enter también envía si el botón no reacciona
-  } else {
-    await page.keyboard.press("Enter");
-  }
+
+  const btn =
+    (await page.$(SELECTORS.sendButton)) ||
+    (await page.$('button:has-text("Enviar")'));
+  if (btn) await btn.click();
+  else await page.keyboard.press("Enter");
 }
 
 async function loop() {
@@ -197,17 +192,14 @@ async function loop() {
   while (true) {
     if (!running) { await page.waitForTimeout(1500); continue; }
 
-    // Espera a que haya conversación o permanece en la cola
     const waiting = await page.$(SELECTORS.waiting);
     if (waiting) {
       await page.waitForTimeout(4000);
-      continue; // sigue esperando hasta que asignen chat
+      continue;
     }
 
-    // Ya hay chat: coge contexto, genera y envía
     const { chat, perfil } = await getContextText();
     if (!chat || chat.length < 10) {
-      // puede que todavía esté cargando
       await page.waitForTimeout(2000);
       continue;
     }
@@ -215,14 +207,12 @@ async function loop() {
     const reply = await generateReply(chat, perfil);
     await sendMessage(reply);
 
-    // Tras enviar, vuelve a pantalla de espera (según tu flujo)
-    await page.waitForTimeout(3000);
-    // Busca si reaparece el estado de espera (si no, seguirá en el mismo chat)
-    // En ambos casos, el bucle continúa.
+    // Ritmo humano
+    await page.waitForTimeout(3000 + Math.floor(Math.random() * 2000));
   }
 }
 
-// ---- Endpoints de control (con token simple) ----
+// --- Endpoints de control ---
 function checkToken(req, res, next) {
   if (req.query.token !== CONTROL_TOKEN) return res.status(401).send("unauthorized");
   next();
@@ -245,7 +235,13 @@ app.get("/html", checkToken, async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, async () => {
+app.listen(port, () => {
   console.log("Server listening on", port);
-  try { await loop(); } catch (e) { console.error(e); process.exit(1); }
+
+  // Arranca el loop con reintentos si falla
+  const run = async () => {
+    try { await loop(); }
+    catch (e) { console.error("Loop error:", e); setTimeout(run, 3000); }
+  };
+  run();
 });
