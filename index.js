@@ -16,8 +16,11 @@ const {
   OPENAI_API_KEY,
   BASE_URL = "https://chathomebase.com/login",
   MODEL = "gpt-4o-mini",
-  CONTROL_TOKEN = "change_me"
+  CONTROL_TOKEN = "change_me",
+  MIN_CHARS: MIN_CHARS_ENV
 } = process.env;
+
+const MIN_CHARS = Number(MIN_CHARS_ENV || 190);
 
 const app = express();
 app.use(express.json());
@@ -25,16 +28,12 @@ app.use(express.json());
 let running = true;
 let browser, context, page;
 
-// mínimo duro (puedes ajustar con variable MIN_CHARS en Railway si quieres)
-const MIN_CHARS = Number(process.env.MIN_CHARS || 190);
-
 const BANNED = [
   "celular", "vos ", "qué rico", "recién", "ahorita", "computadora",
   "cachetadas", "jalar", "platicar", "carro", "papi", "lechita", "coger "
 ];
 
 /* ========== Utilidades UI / Overlays ========== */
-
 async function clickIfVisible(locator) {
   try {
     const el = locator.first();
@@ -88,16 +87,9 @@ async function dismissOnboardingWizard(p) {
   for (let i = 0; i < 12; i++) {
     await acceptCookiesAnywhere(p);
     const closeBtn = p.getByRole("button", { name: /close|cerrar|entendido|hecho|ok/i });
-    if (await closeBtn.count()) {
-      try { await closeBtn.first().click({ timeout: 1500 }); } catch {}
-      await p.waitForTimeout(200);
-    }
+    if (await closeBtn.count()) { try { await closeBtn.first().click({ timeout: 1500 }); } catch {} }
     const nextBtn = p.getByRole("button", { name: /next|siguiente/i });
-    if (await nextBtn.count()) {
-      try { await nextBtn.first().click({ timeout: 1500 }); } catch {}
-      await p.waitForTimeout(200);
-      continue;
-    }
+    if (await nextBtn.count()) { try { await nextBtn.first().click({ timeout: 1500 }); } catch {} }
     const wizardVisible =
       await p.getByText(/información importante sobre expresiones/i).first().isVisible().catch(()=>false);
     if (!wizardVisible) break;
@@ -106,7 +98,6 @@ async function dismissOnboardingWizard(p) {
 }
 
 /* ========== Navegador y login ========== */
-
 async function ensureBrowser() {
   if (browser) return;
   browser = await chromium.launch({
@@ -151,8 +142,8 @@ async function loginIfNeeded() {
   await dismissOnboardingWizard(page);
   await clearOverlays(page);
 
-  const waitingSel = "text=Waiting for conversation to be claimed";
-  if (await page.locator(waitingSel).first().isVisible().catch(()=>false)) return;
+  // ¿Ya dentro?
+  if (await isQueueVisible()) return;
 
   await clickIfVisible(page.getByText(/^CHAT$/i));
   await clickIfVisible(page.getByRole("button", { name: /login|entrar|iniciar sesión|sign in/i }));
@@ -192,10 +183,51 @@ async function loginIfNeeded() {
   await page.waitForTimeout(600);
 }
 
-/* ========== Chat: extracción / generación / envío ========== */
+/* ========== Cola y claiming ========== */
+async function isQueueVisible() {
+  // Pantallas típicas de cola
+  const waiting = await page.getByText(/Waiting for conversation to be claimed/i).first().isVisible().catch(()=>false);
+  const startBtn = await getStartChattingLocator();
+  const startVisible = startBtn && await startBtn.isVisible().catch(()=>false);
+  return waiting || startVisible;
+}
 
+function getStartChattingLocator() {
+  // Varias formas del botón
+  const locs = [
+    page.getByRole("button", { name: /start chatting|start chat|start/i }),
+    page.getByText(/^START CHATTING$/i),
+    page.locator("[data-testid='start-chatting'], [data-test='start-chatting']")
+  ];
+  return {
+    async isVisible() {
+      for (const l of locs) { try { if (await l.first().isVisible({ timeout: 200 })) return true; } catch {} }
+      return false;
+    },
+    async click() {
+      for (const l of locs) {
+        try { if (await l.first().isVisible({ timeout: 200 })) { await l.first().click({ timeout: 1000 }); return true; } } catch {}
+      }
+      return false;
+    }
+  };
+}
+
+async function tryStartChatting() {
+  await clearOverlays(page);
+  const start = getStartChattingLocator();
+  if (await start.isVisible()) {
+    const ok = await start.click();
+    if (ok) {
+      await page.waitForTimeout(800);
+      return true;
+    }
+  }
+  return false;
+}
+
+/* ========== Chat: extracción / generación / envío ========== */
 const SELECTORS = {
-  waiting: "text=Waiting for conversation to be claimed",
   chatArea: "main, div[role='main'], div[data-testid='chat']",
   inputCandidates: [
     "textarea",
@@ -235,20 +267,16 @@ async function getContextText() {
   return { chat: trimmedChat, perfil };
 }
 
-// --- asegura longitud mínima y pregunta final ---
 function ensureMinLength(text) {
   const fillers = [
-    " Me gusta hablar con calma y con buen rollo; así nos conocemos mejor y sale todo más natural.",
-    " Cuéntame algo de tu día o qué te apetece ahora mismo; me hace ilusión saberlo y seguir charlando contigo."
+    " Me gusta hablar con calma y con buen rollo; así nos conocemos mejor y todo fluye.",
+    " Cuéntame cómo te va el día o qué te apetece ahora; me hace ilusión saberlo y seguir charlando."
   ];
   let out = text.trim();
-
-  // Si no termina en ?, añade una pregunta abierta al final
   if (!/[?？]\s*$/.test(out)) {
     out = out.replace(/[.!…]*\s*$/, "");
     out += " ¿Tú qué opinas?";
   }
-
   while (out.length < MIN_CHARS) {
     out += fillers[(out.length / 80) % fillers.length | 0];
     if (!/[?？]\s*$/.test(out)) out += " ¿Qué te gustaría ahora?";
@@ -294,7 +322,7 @@ async function generateReply(chat, perfil) {
     text = await generateRepair(text);
     break;
   }
-  return ensureMinLength(text); // segunda pasada por si reescribe corto
+  return ensureMinLength(text);
 }
 
 async function generateRepair(prev) {
@@ -357,7 +385,6 @@ async function sendMessage(text) {
 }
 
 /* ========== Bucle principal ========== */
-
 async function loop() {
   await ensureBrowser();
   await loginIfNeeded();
@@ -366,12 +393,13 @@ async function loop() {
     if (!running) { await page.waitForTimeout(1500); continue; }
 
     await dismissOnboardingWizard(page);
+    await clearOverlays(page);
 
-    if (await page.locator("text=Waiting for conversation to be claimed").first().isVisible().catch(()=>false)) {
-      await clearOverlays(page);
-      await page.waitForTimeout(4000);
-      continue;
-    }
+    // Si hay botón START CHATTING, púlsalo.
+    if (await tryStartChatting()) { await page.waitForTimeout(1500); continue; }
+
+    // Si seguimos en cola, espera y reintenta.
+    if (await isQueueVisible()) { await page.waitForTimeout(4000); continue; }
 
     const { chat, perfil } = await getContextText();
     if (!chat || chat.length < 10) { await page.waitForTimeout(2000); continue; }
@@ -385,7 +413,6 @@ async function loop() {
 }
 
 /* ========== Endpoints control ========== */
-
 function checkToken(req, res, next) {
   if (req.query.token !== CONTROL_TOKEN) return res.status(401).send("unauthorized");
   next();
