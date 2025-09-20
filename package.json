@@ -1,0 +1,17 @@
+{
+  "name": "autobase",
+  "version": "1.0.0",
+  "description": "Playwright bot for chathomebase",
+  "private": true,
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2",
+    "playwright": "^1.46.0"
+  }
+}
