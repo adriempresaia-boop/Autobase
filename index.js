@@ -1,7 +1,11 @@
 require("dotenv").config();
 const express = require("express");
 const { chromium } = require("playwright");
-
+// Polyfill de fetch en Node (si no existe)
+let fetch = global.fetch;
+if (!fetch) {
+  fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+}
 const {
   EMAIL,
   PASSWORD,
