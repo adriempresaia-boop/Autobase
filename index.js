@@ -1,4 +1,4 @@
-// index.js — Autobase (CommonJS, sin borrar nunca)
+// index.js — Autobase CJS (no borra nunca, no usa panel YOU ARE)
 require("dotenv").config();
 const express = require("express");
 const { chromium } = require("playwright");
@@ -13,8 +13,8 @@ const {
   MIN_CHARS: MIN_CHARS_ENV
 } = process.env;
 
-const MIN_CHARS = Number(MIN_CHARS_ENV || 170);
-const CHAT_LAST_LINES = 8;
+const MIN_CHARS = Number(MIN_CHARS_ENV || 170);  // >=150 por norma
+const CHAT_LAST_LINES = 8;                       // solo últimos mensajes
 
 let browser, context, page;
 let running = true;
@@ -28,28 +28,8 @@ const fetchFn = globalThis.fetch
   ? (...a)=>globalThis.fetch(...a)
   : (...a)=>import("node-fetch").then(({default:f})=>f(...a));
 
-// Palabras a evitar (latam + prohibidas)
-const BANNED = [
-  "celular","vos ","qué rico","recién","ahorita","computadora",
-  "cachetadas","jalar","platicar","carro","papi","lechita"," coger "
-];
-
-// Normalizaciones a español ES
-const REPLACEMENTS = [
-  [/computadora/gi,"ordenador"],
-  [/celular/gi,"móvil"],
-  [/con gusto/gi,"encantado"],
-  [/platicar/gi,"charlar"],
-  [/carro/gi,"coche"],
-  [/órale/gi,"vale"],
-  [/ahorita/gi,"ahora"],
-  [/vos(?:otros)?/gi,"tú"],
-  [/\s+coger\s+/gi," tener "], // evitar sexual explícito
-];
-
-// ---------- Navegador ----------
+// --------- utilidades UI ----------
 async function ensureBrowser(){
-  if (browser && !browser.isConnected?.()) { try{await browser.close();}catch{} browser=null; }
   if (!browser){
     browser = await chromium.launch({
       headless: true,
@@ -73,7 +53,7 @@ async function ensureBrowser(){
 }
 
 async function acceptCookiesAnywhere(p){
-  const texts=[/aceptar/i,/aceptar todas/i,/ok/i,/entendido/i,/close/i,/agree/i,/accept/i];
+  const texts=[/aceptar/i,/aceptar todas/i,/ok/i,/entendido/i,/close/i,/agree|accept/i];
   for (const t of texts){
     try{
       const b=p.getByRole("button",{name:t});
@@ -170,37 +150,36 @@ async function getContextText(){
     const n = document.querySelector(sel);
     return n ? n.innerText : "";
   });
-  let perfil = "";
-  try{
-    perfil = await page.evaluate(()=>{
-      const n=[...document.querySelectorAll("*")].find(x=>/YOU ARE/i.test(x.innerText||""));
-      const b=n?.closest("aside")||n?.parentElement;
-      return b? b.innerText : (n?.innerText||"");
-    });
-  }catch{}
   return {
-    chat:(chatText||"").split("\n").slice(-CHAT_LAST_LINES).join("\n"),
-    perfil
+    chat:(chatText||"").split("\n").slice(-CHAT_LAST_LINES).join("\n")
   };
 }
 
-// ---------- Generación ----------
+// ---------- Generación solo con chat ----------
+const BANNED = ["celular","vos ","qué rico","recién","ahorita","computadora","cachetadas","jalar","platicar","carro","papi","lechita"," coger "];
+const REPLACEMENTS = [
+  [/computadora/gi,"ordenador"],
+  [/celular/gi,"móvil"],
+  [/platicar/gi,"charlar"],
+  [/carro/gi,"coche"],
+  [/ahorita/gi,"ahora"],
+  [/vos(?:otros)?/gi,"tú"],
+  [/\s+coger\s+/gi," tener "],
+];
+
 function sanitizeEs(text){
   let out=(text||"").trim();
   for (const [re,rep] of REPLACEMENTS) out = out.replace(re,rep);
   for (const w of BANNED) out = out.replace(new RegExp(w,"gi"),"");
-  // quitar markdown raro
   out = out.replace(/[*_#>`~\[\]\(\)]/g,"").replace(/\s{2,}/g," ").trim();
-  // asegurar cierre amable y pregunta
   if (!/[?¿]\s*$/.test(out)) { out = out.replace(/[.!…]*\s*$/, ""); out += " ¿Tú qué dirías?"; }
   return out;
 }
-
 function ensureMinLength(text){
   const fillers = [
-    " Me apetece llevarlo con naturalidad y picardía, sin prisas.",
-    " Si te parece, seguimos por ahí y vamos viendo con calma.",
-    " Me gusta escucharte y jugar con esa chispa, a nuestro ritmo."
+    " Me gusta llevarlo con naturalidad y picardía, sin prisas.",
+    " Si te parece, seguimos por ahí y lo hilamos con calma.",
+    " Me encanta escucharte y jugar con esa chispa, a nuestro ritmo."
   ];
   let out=sanitizeEs(text);
   while(out.length<MIN_CHARS){
@@ -209,19 +188,11 @@ function ensureMinLength(text){
   }
   return out;
 }
-
-function buildPrompt({chat,perfil}){
+function buildPrompt(chat){
   return `
-Escribe UNA respuesta breve en español de España, tono cercano y coqueto pero sin cruzar líneas, sin tacos, sin proponer quedar, sin datos personales ni enlaces.
-Usa SOLO el contexto de los últimos mensajes, termina con una pregunta abierta. 180-230 caracteres aprox.
+Escribe UNA sola respuesta en español de España, cercana y coqueta pero sin cruzar líneas. Prohibido insultos, proponer quedar, datos personales o contenido explícito. 180-230 caracteres aprox. Termina con una pregunta abierta. Evita latam (celular, vos, qué rico, recién, ahorita, computadora, jalar, platicar, carro, papi, lechita, "coger" sexual).
 
-Evita latam: celular, vos, qué rico, recién, ahorita, computadora, jalar, platicar, carro, papi, lechita, "coger" (sexual).
-No uses listas, emojis raros ni formato markdown.
-
-Personaje (panel "YOU ARE"):
-${perfil || "No disponible"}
-
-Últimos mensajes:
+Últimos mensajes (usa SOLO esto):
 ${chat || "No disponible"}
 `.trim();
 }
@@ -229,12 +200,11 @@ ${chat || "No disponible"}
 const lastMessages = [];
 const LAST_N = 12;
 
-async function generateReply(chat,perfil){
-  // Fallback local si no hay API
+async function generateReply(chat){
   async function local(){
     const last = (chat||"").split("\n").slice(-5).join(" ").trim();
-    let s = last ? `Sobre lo que me cuentas: ${last}. ` : "";
-    s += "Soy natural y juguetona; me gusta hablar con elegancia y chispa. ";
+    let s = last ? `Te leo y me quedo con esto: ${last}. ` : "";
+    s += "Soy natural y juguetona; me gusta la conversación con elegancia y chispa. ";
     s += "¿Seguimos por ahí y me cuentas un poco más?";
     s = ensureMinLength(s);
     if(lastMessages.includes(s)) s += " Me dejas con curiosidad.";
@@ -253,8 +223,8 @@ async function generateReply(chat,perfil){
         model: MODEL,
         temperature: 0.9,
         messages:[
-          {role:"system",content:"Responde en español de España. Cumple normas: nada de quedar, ni insultos, ni datos, ni contenido explícito."},
-          {role:"user",content:buildPrompt({chat,perfil})}
+          {role:"system",content:"Responde en español de España. Nada de quedar, ni insultos, ni datos, ni explícito."},
+          {role:"user",content:buildPrompt(chat)}
         ]
       })
     });
@@ -272,7 +242,7 @@ async function generateReply(chat,perfil){
   }
 }
 
-// ---------- Entrada y envío (sin borrar nunca) ----------
+// ---------- Entrada y envío (sin borrar y sin reescribir) ----------
 const SELECTORS = {
   inputCandidates: [
     "textarea",
@@ -310,14 +280,14 @@ async function getInputValue(h){
   }catch{return "";}
 }
 
-// Tecleo humano (SIN errores y SIN backspace)
+function rand(a,b){ return Math.floor(Math.random()*(b-a+1))+a; }
 async function humanType(h, text, mode="fast"){
   const perChar = mode==="slow" ? [65,110] : [33,70];
   const pauseWord = mode==="slow" ? [160,300] : [80,160];
   const pausePunct= mode==="slow" ? [300,620] : [180,360];
 
   await h.focus();
-  const tokens = text.split(/(\s+)/); // conserva espacios
+  const tokens = text.split(/(\s+)/);
   for (const tk of tokens){
     for (const ch of tk){
       try{ await page.keyboard.type(ch,{delay: rand(perChar[0],perChar[1])}); }catch{}
@@ -340,13 +310,35 @@ async function closeCopyWarning(){
   return false;
 }
 
-async function waitPosted(text, timeoutMs=6500){
-  const before = await page.evaluate(sel => (document.querySelector(sel)?.innerText)||"", SELECTORS.chatArea);
+async function clickSendNearInput(input) {
+  try{
+    const el = await input.elementHandle();
+    const clicked = await page.evaluate((n)=>{
+      function visible(e){ const s=getComputedStyle(e); return s && s.visibility!=='hidden' && s.display!=='none' && e.offsetParent!==null; }
+      const root = n.closest('form') || n.closest('div') || document;
+      const btns = [...root.querySelectorAll('button,[role="button"],.btn,.v-btn')];
+      for(const b of btns){
+        const t=(b.innerText||"").toLowerCase();
+        const svg=(b.querySelector("svg")||{}).outerHTML||"";
+        if(!visible(b)) continue;
+        if(/enviar|send|submit/.test(t) || /plane/.test(svg) || b.type==="submit"){ b.click(); return true; }
+      }
+      return false;
+    }, el);
+    if (clicked) return true;
+  }catch{}
+  return false;
+}
+
+async function waitPostedOrCleared(input, text, timeoutMs=6500){
+  const beforeChat = await page.evaluate(sel => (document.querySelector(sel)?.innerText)||"", SELECTORS.chatArea);
   const snippet = (text||"").slice(0,45).replace(/\s+/g," ").trim();
   const end = Date.now()+timeoutMs;
   while(Date.now()<end){
-    const now = await page.evaluate(sel => (document.querySelector(sel)?.innerText)||"", SELECTORS.chatArea);
-    if (now.length>before.length && now.includes(snippet)) return true;
+    const nowChat = await page.evaluate(sel => (document.querySelector(sel)?.innerText)||"", SELECTORS.chatArea);
+    const val = await getInputValue(input);
+    if (!val || val.trim()==="") return true;                 // se vació el cuadro
+    if (nowChat.length>beforeChat.length && nowChat.includes(snippet)) return true; // apareció en chat
     await page.waitForTimeout(220);
   }
   return false;
@@ -354,7 +346,7 @@ async function waitPosted(text, timeoutMs=6500){
 
 async function sendMessage(text){
   try{
-    // localizar input (sin limpiar)
+    // localizar input
     const end=Date.now()+7000;
     let input=null;
     while(!input && Date.now()<end){
@@ -363,38 +355,56 @@ async function sendMessage(text){
     }
     if(!input){ log("INPUT not found"); return false; }
 
-    // escribir rápido (sin borrar nada)
-    await humanType(input, text, "fast");
-
-    // si la plataforma lo “come”, cerrar aviso y re-escribir más lento (sin borrar)
-    let val = await getInputValue(input);
-    if (val.length < Math.min(90, Math.floor(text.length*0.5))){
-      log("Anti-paste? retype slow");
-      await closeCopyWarning();
-      await humanType(input, text, "slow");
-      val = await getInputValue(input);
+    // si ya está escrito (de reintentos previos), NO volver a escribir
+    let current = await getInputValue(input);
+    const already = current && (current.length >= Math.min(text.length*0.6, 120));
+    if (!already){
+      // escribir una sola vez (rápido)
+      await humanType(input, text, "fast");
+      await page.waitForTimeout(120);
+      current = await getInputValue(input);
+      if (current.length < Math.min(90, Math.floor(text.length*0.5))){
+        // el sitio “se comió” texto: cerrar aviso y escribir MÁS LENTO (sin borrar)
+        log("Anti-paste? retype slow");
+        await closeCopyWarning();
+        await humanType(input, text, "slow");
+        current = await getInputValue(input);
+      }
     }
 
-    // enviar
-    const btn = page.locator(SELECTORS.sendButton).first();
-    if (await btn.count()){
-      try{ await btn.click({timeout:900}); }
-      catch{ await btn.click({timeout:900,force:true}); }
-    } else {
-      await page.keyboard.press("Enter");
+    // enviar: botón cerca del input -> Enter -> Ctrl+Enter
+    let clicked = await clickSendNearInput(input);
+    if (!clicked){
+      try{ await input.focus(); await page.keyboard.press("Enter"); }catch{}
+    }
+    await page.waitForTimeout(250);
+    if (!clicked){
+      try{
+        await input.focus();
+        await page.keyboard.down("Control");
+        await page.keyboard.press("Enter");
+        await page.keyboard.up("Control");
+      }catch{}
     }
     log("SEND pressed");
 
-    // verificar publicación; si falla, reintentar una vez (sin borrar)
-    let ok = await waitPosted(text, 7000);
+    // verificar; no reescribe en ningún caso
+    let ok = await waitPostedOrCleared(input, text, 7500);
     if (!ok){
-      log("Not posted; retry ultra-slow");
-      await closeCopyWarning();
-      await humanType(input, " ", "slow"); // “rompe” heurística de duplicado sin borrar
-      await humanType(input, text, "slow");
-      if (await btn.count()){ try{ await btn.click({timeout:900}); }catch{ await btn.click({timeout:900,force:true}); } }
-      else { await page.keyboard.press("Enter"); }
-      ok = await waitPosted(text, 8000);
+      log("Not posted; retry press only");
+      // solo re-intentar la acción de enviar, sin tocar el texto
+      clicked = await clickSendNearInput(input);
+      if (!clicked){ try{ await input.focus(); await page.keyboard.press("Enter"); }catch{} }
+      await page.waitForTimeout(250);
+      if (!clicked){
+        try{
+          await input.focus();
+          await page.keyboard.down("Control");
+          await page.keyboard.press("Enter");
+          await page.keyboard.up("Control");
+        }catch{}
+      }
+      ok = await waitPostedOrCleared(input, text, 8000);
     }
     return ok;
   }catch(e){
@@ -410,15 +420,13 @@ async function sendMessage(text){
   }
 }
 
-// ---------- Bucle ----------
+// ---------- Login + bucle ----------
 async function loginIfNeeded(){
   await page.goto(BASE_URL, { waitUntil: "domcontentloaded" });
   await acceptCookiesAnywhere(page);
   await dismissOnboardingWizard(page);
-
   if (await isLoginForm()) await performLogin();
   await page.waitForTimeout(350);
-
   await dismissOnboardingWizard(page);
   await acceptCookiesAnywhere(page);
 }
@@ -438,17 +446,15 @@ async function loop(){
       if (await tryStartChatting()){ await page.waitForTimeout(400); continue; }
       if (await isQueueVisible()){ await page.waitForTimeout(1200); continue; }
 
-      const { chat, perfil } = await getContextText();
+      const { chat } = await getContextText();
       if(!chat || chat.length<10){ await page.waitForTimeout(500); continue; }
 
-      let reply = await generateReply(chat, perfil);
-      reply = sanitizeEs(reply);
-      reply = ensureMinLength(reply);
+      let reply = await generateReply(chat);
+      reply = ensureMinLength(reply); // español y longitud
 
       const ok = await sendMessage(reply);
       if (!ok) log("send failed, next loop");
 
-      // pausa corta para no agotar tiempo de turno
       await page.waitForTimeout(600 + Math.floor(Math.random()*400));
     }catch(e){
       log("Loop error:", e?.message||e);
@@ -482,6 +488,3 @@ app.listen(port, ()=>{
   log("Server listening on", port);
   (async function run(){ try{ await loop(); } catch(e){ log("Top-level error:", e); setTimeout(run, 1500); } })();
 });
-
-// utils
-function rand(a,b){ return Math.floor(Math.random()*(b-a+1))+a; }
